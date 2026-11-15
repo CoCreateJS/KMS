@@ -1,0 +1,45 @@
+{
+  "name": "@cocreate/kms",
+  "version": "1.0.0",
+  "description": "Organization-scoped cryptographic key management, encryption, decryption, rotation, and lifecycle management for CoCreate.",
+  "keywords": [
+    "cocreate",
+    "kms",
+    "key-management",
+    "encryption",
+    "cryptography",
+    "key-rotation",
+    "secret-management",
+    "multi-tenant",
+    "esm",
+    "server"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src/",
+    "specifications/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CoCreateJS/KMS.git"
+  },
+  "author": "CoCreate LLC",
+  "bugs": {
+    "url": "https://github.com/CoCreateJS/KMS/issues"
+  },
+  "homepage": "https://CoCreateJS.com/docs/kms"
+}

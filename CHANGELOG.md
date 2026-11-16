@@ -3,7 +3,7 @@
 
 ### Features
 
-* initial CoCreate KMS release ([9a0b397](https://github.com/CoCreateJS/KMS/commit/9a0b3973b7b5be165969e4547858405abe535bf5))
+* initial CoCreate KMS release ([9a0b397](https://github.com/CoCreateJS/kms/commit/9a0b3973b7b5be165969e4547858405abe535bf5))
 
 # Changelog
 

@@ -35,11 +35,11 @@
   "license": "AGPL-3.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CoCreateJS/KMS.git"
+    "url": "git+https://github.com/CoCreateJS/kms.git"
   },
   "author": "CoCreate LLC",
   "bugs": {
-    "url": "https://github.com/CoCreateJS/KMS/issues"
+    "url": "https://github.com/CoCreateJS/kms/issues"
   },
   "homepage": "https://CoCreateJS.com/docs/kms"
 }

@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/CoCreateJS/kms/compare/v1.0.0...v1.1.0) (2026-11-17)
+
+
+### Features
+
+* add portable cryptography APIs ([2316d92](https://github.com/CoCreateJS/kms/commit/2316d9273542e606e7932d7c7ad32bbab2c317e5))
+
 # 1.0.0 (2026-11-15)
 
 

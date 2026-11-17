@@ -44,3 +44,7 @@ The named workflows are invoked through `server.workflow.run()`. Their precise p
 Workflow store requests contain plaintext key material so the workflow can apply the configured storage encoding/protection. Workflows must not log or expose that material. Fetch workflows must return usable 32-byte key material to KMS in process memory. KMS API return values omit the material.
 
 When a request has `user_id` or `apikey`, KMS uses the server authorization service for the corresponding KMS operation. Internal calls without request identity are trusted server-to-server operations.
+
+## Portable cryptography entry points
+
+The package root resolves to `src/server.js` in Node and `src/browser.js` in browser-aware bundlers. The Node entry combines the existing managed server API and standalone portable namespaces; the browser entry exports only the standalone portable namespaces. Explicit `@cocreate/kms/server`, `@cocreate/kms/browser`, and `@cocreate/kms/portable` subpaths are available. These utilities use Web Crypto and caller-supplied keys; they do not change the managed KMS workflow or persistence contract.

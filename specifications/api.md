@@ -1,33 +1,42 @@
 # API and Key Records
 
-All public KMS methods accept one object argument. `init(server)` returns the API; `close()` releases local timers and cached key records.
+All public methods accept one object argument. `init(server)` returns a stable API object for that server context. Every managed operation requires a trusted `organization_id` and `host`, supplied at the top level or in `scopes`.
 
 ## Methods
 
 | Method | Responsibility |
 |---|---|
-| `generate({ scopes, name?, description?, tags?, rotation?, expires? })` | Generate version 1, invoke the configured store workflow, cache the key, and return public metadata. |
-| `encrypt({ scopes, _id, data, context? })` | Resolve the newest locally eligible version and return ciphertext plus metadata. |
-| `decrypt({ scopes, data, metadata, allowExpired?, allowRevoked? })` | Resolve the exact version in `metadata.key` and decrypt. |
-| `get({ scopes, _id })` | Resolve an exact key version from the local Map, then the configured fetch workflow. |
-| `set({ scopes, key })` | Cache a key in this process only. It does not invoke a storage workflow. |
-| `invalidate({ scopes, _id? })` | Remove a key or lineage from this process's cache after external lifecycle changes. |
-| `rotate({ scopes, _id, delay?, verify? })` | Generate and store a new version in the same lineage. |
-| `revoke({ scopes, _id, by? })` | Revoke the specified version and invoke the store workflow with a lifecycle event. |
-| `setExpiration({ scopes, _id, on })` | Set or clear the expiration date and invoke the store workflow. Pass `on: null` to clear expiration. |
-| `delete({ scopes, _id, by? })` | Mark the specified version logically deleted and invoke the store workflow. |
-| `destroy({ scopes, _id, confirm, dependenciesCleared })` | Remove key material from KMS state and notify the store workflow after explicit confirmation. |
+| `generate({ organization_id, host, name?, description?, tags?, rotation?, expires? })` | Generate and create version 1 in CRUD, cache its material, and return public metadata. |
+| `encrypt({ organization_id, host, _id, data, context? })` | Resolve the newest eligible version and return ciphertext plus metadata. |
+| `decrypt({ organization_id, host, data, metadata, allowExpired?, allowRevoked? })` | Read the exact referenced version and decrypt. |
+| `get({ organization_id, host, _id })` | Resolve an exact version from the tenant-scoped cache or CRUD. |
+| `set({ organization_id, host, key })` | Add a trusted server-side key record to the tenant-scoped local cache. |
+| `invalidate({ organization_id, host, _id? })` | Remove a key or lineage from this process's cache after an external lifecycle change. |
+| `rotate({ organization_id, host, _id, delay?, verify? })` | Read a lineage, create a new version in CRUD, and preserve historical versions. |
+| `revoke({ organization_id, host, _id, by? })` | Update the version's revocation metadata in CRUD. |
+| `setExpiration({ organization_id, host, _id, on })` | Set or clear expiration in CRUD; pass `on: null` to clear it. |
+| `delete({ organization_id, host, _id, by? })` | Mark the version logically deleted in CRUD. |
+| `destroy({ organization_id, host, _id, confirm, dependenciesCleared })` | Clear local key material and update the record after explicit confirmation. |
 
-KMS has no public `read()` or `save()` method. Cache misses and lifecycle persistence are handled by the configured fetch/store workflows.
+`close()` releases local timers and cached key records. It also clears the singleton registration for that server object so it can be initialized again.
+
+## CRUD contract
+
+Managed records are stored in `database: "app"`, `array: "keys"`, with `type: "cryptographic"`. KMS uses `object.read` for exact versions and lineages, `object.create` for newly generated versions, and `object.update` for lifecycle changes. Each envelope carries the request's `organization_id` and `host`.
+
+KMS treats a CRUD response containing `error` or `success: false` as failure. A response without either is success; KMS does not wait for CRUD's subsequent distribution or persistence work. CRUD-generated `created` and `updated` metadata is left to CRUD.
+
+Key material is included in the managed CRUD record and is never included in KMS's public key metadata result. Protect access to the shared `keys` array using the host application's authorization policies.
 
 ## Key record
 
-Each version is a separate document-shaped value with a unique ObjectId:
+Each version is a separate document with a unique ObjectId:
 
 ```js
 {
   _id: "24-hex-object-id-for-this-version",
   type: "cryptographic",
+  organization_id: "tenant-object-id",
   key: "24-hex-object-id-for-lineage-root",
   version: 1,
   algorithm: "AES-256-GCM",
@@ -41,8 +50,4 @@ Each version is a separate document-shaped value with a unique ObjectId:
 }
 ```
 
-This is KMS's in-memory key shape. A store workflow may transform it into any storage representation. A fetch workflow must return the KMS shape with decoded key material.
-
-The lineage root has `key` equal to its own `_id`; later versions point to that root. `metadata.key` in ciphertext identifies the exact version document. `name`, `description`, and `tags` are optional descriptions, never identifiers. `purpose` is not part of the KMS key contract.
-
-Public methods return key metadata without `keyMaterial`. `set()` accepts a secret-bearing record only for trusted server-side use.
+The lineage root has `key` equal to its own `_id`; later versions point to that root. `metadata.key` in ciphertext identifies the exact version document. `name`, `description`, and `tags` are optional descriptions, never identifiers. Public methods return metadata without `keyMaterial`.

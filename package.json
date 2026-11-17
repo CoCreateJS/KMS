@@ -1,7 +1,7 @@
 {
   "name": "@cocreate/kms",
   "version": "1.1.0",
-  "description": "Organization-scoped cryptographic key management, encryption, decryption, rotation, and lifecycle management for CoCreate.",
+  "description": "Tenant-scoped cryptographic key management and cryptographic utilities for CoCreate.",
   "keywords": [
     "cocreate",
     "kms",

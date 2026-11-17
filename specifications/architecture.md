@@ -1,50 +1,31 @@
-# Architecture and Responsibility
+# Architecture and Tenancy
 
-## KMS owns
+## Service initialization
 
-- Secure key generation and in-process key access.
-- Encryption, decryption, key versions, rotation, activation, expiration, revocation, logical deletion, and key destruction requests.
-- A private in-memory `Map` keyed by the exact key-version ObjectId.
-- Public result sanitization so plaintext key material is not returned from API methods.
-
-KMS does not own persistence, database access, provider selection, serialization for storage, replication, or distributed coordination.
-
-## Workflows own
-
-Configured workflows decide whether key material is stored, where it is stored, how it is encoded or protected at rest, how records are retrieved and decoded, and how storage-specific lifecycle operations are performed. A workflow may use any configured service or no storage at all.
-
-KMS passes key records and lifecycle events to the configured workflow contract. It does not call persistence providers directly and does not assume the shape of their data APIs.
-
-## Initialization and scope
-
-Cluster attaches KMS with `this.kms = KMS.init(this)`. Initialization performs no persistence operations. Storage workflows are invoked only when a KMS API operation reaches a documented storage or retrieval point.
-
-KMS uses `organization_id`, `host`, and opaque `scopes` to identify the tenant context for authorization, workflow execution, and cache isolation. KMS does not map scopes to a storage-specific location or query.
-
-## Workflow configuration
-
-Workflow names are supplied on the server:
+KMS is a server service, not a tenant-specific object factory. Cluster initializes it after CRUD is available and attaches the returned API:
 
 ```js
-server.kmsConfig = {
-  workflows: {
-    store: "kmsStoreKey",
-    fetch: "kmsFetchKey",
-    verify: "kmsVerifyKey"
-  }
-};
+server.kms = KMS.init(server);
 ```
 
-`store` and `fetch` are optional. Without `store`, generated and rotated keys remain process-local. Without `fetch`, a cache miss returns no key. `verify` is optional and is required only when a key's rotation policy requests verification.
+Calling `init()` again with the same server object returns the same API instance. The instance owns process-local caches and timers. Each worker or server process has its own instance and cache.
 
-The named workflows are invoked through `server.workflow.run()`. Their precise payload and result contract is defined in [Workflow Usage](workflow-usage.md).
+The server object supplies tools such as `server.crud` and authorization. It is not the tenant identity and KMS does not attach itself to the server; the caller performs that assignment.
 
-## Security boundary
+## Tenant context
 
-Workflow store requests contain plaintext key material so the workflow can apply the configured storage encoding/protection. Workflows must not log or expose that material. Fetch workflows must return usable 32-byte key material to KMS in process memory. KMS API return values omit the material.
+The HTTP/Cluster layer resolves the request hostname to an organization and passes trusted `organization_id` and `host` values to KMS. Every managed operation requires both values, either at the top level or within the accepted `scopes` context. KMS does not resolve hostnames, infer an organization from server-wide defaults, or select a tenant at initialization.
 
-When a request has `user_id` or `apikey`, KMS uses the server authorization service for the corresponding KMS operation. Internal calls without request identity are trusted server-to-server operations.
+Every CRUD envelope includes the operation's `organization_id` and `host`. Key cache entries are isolated by that same pair, so a key cached for one tenant cannot satisfy a request for another tenant. Callers must only pass trusted tenant context established by the host application.
 
-## Portable cryptography entry points
+## Data operations
 
-The package root resolves to `src/server.js` in Node and `src/browser.js` in browser-aware bundlers. The Node entry combines the existing managed server API and standalone portable namespaces; the browser entry exports only the standalone portable namespaces. Explicit `@cocreate/kms/server`, `@cocreate/kms/browser`, and `@cocreate/kms/portable` subpaths are available. These utilities use Web Crypto and caller-supplied keys; they do not change the managed KMS workflow or persistence contract.
+KMS uses `server.crud.send()` directly for managed key records in the `app` database and `keys` array. Records are distinguished by `type: "cryptographic"` and include a tenant's organization identity. KMS performs reads, creates, and updates needed by its API. It does not implement a database, provider adapter, replication process, or separate persistence path.
+
+CRUD handles its in-memory data path, peer distribution, retries, and configured persistence. KMS considers the request successful when CRUD returns without `error` and without `success: false`; it does not wait for later persistence or peer work.
+
+CRUD owns database-managed `created` / `updated` metadata. KMS owns cryptographic material, key versions, activation, expiration, revocation, and logical deletion metadata.
+
+## Portable cryptography
+
+Portable Web Crypto and JOSE utilities accept caller-supplied key material and do not use the managed key store. They can be used independently of a CoCreate server.

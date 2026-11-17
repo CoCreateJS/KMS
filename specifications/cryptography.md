@@ -4,7 +4,7 @@
 
 The initial algorithm is AES-256-GCM. Each KMS key version contains a random 32-byte KEK. Each encrypted value receives an independent random 32-byte DEK. KMS encrypts the value with the DEK and wraps the DEK with the selected KEK.
 
-KMS generates key material and uses it in process. KMS does not define how the KEK is encoded or protected when a workflow stores it. The store workflow may encrypt, wrap, encode, or route the key using deployment-specific policy. The fetch workflow retrieves and decodes it before returning it to KMS.
+KMS generates key material and uses it in process. Managed key records, including their material, are sent through the tenant-scoped CRUD API. CRUD and CoCreateDB own the configured data and persistence lifecycle; KMS does not implement a separate storage adapter.
 
 ## Ciphertext format
 
@@ -30,13 +30,15 @@ The data AES-GCM additional authenticated data binds `format`, `key`, `version`,
 
 ## Secret handling
 
-Plaintext key material is held in KMS process memory and is not returned from public methods. Store workflows receive a secret-bearing key record by design so they can apply deployment policy. They must avoid logging the record and must return decoded 32-byte material only to authorized KMS operations. JavaScript strings and garbage-collected copies cannot be reliably zeroized; temporary buffers are cleared where practical.
+Key material is held in KMS process memory and is not returned from public methods. Managed key records carry material in CRUD requests and responses; protect the shared keys array using host authorization policy. JavaScript strings and garbage-collected copies cannot be reliably zeroized; temporary buffers are cleared where practical.
 
 ## Portable Web Crypto API
 
-The portable API in `src/portable/` is separate from the managed key-record API. It accepts raw bytes or `CryptoKey` values supplied by the caller and performs no organization lookup, persistence, key rotation, or workflow invocation.
+The portable API in `src/portable/` is separate from the managed key-record API. It accepts raw bytes or `CryptoKey` values supplied by the caller and performs no organization lookup, CRUD access, persistence, or key rotation.
 
 The exported namespaces are `crypto`, `aes`, `sha256`, `ed25519`, `rsa.pss`, `encoding`, `jws`, `jwt`, and `jwk`. Supported primitives are AES-128-GCM and AES-256-GCM; SHA-256, SHA-384, SHA-512; HMAC; Ed25519; and RSA-PSS with SHA-256. JOSE supports only HS256, PS256, and EdDSA. JWS verification requires an explicit expected algorithm matching the protected header and a trusted key supplied by the caller. CryptoKey type, permitted usage, and hash are checked against that algorithm. HS256 keys must be at least 256 bits. Empty JWS payloads are supported.
+
+The Node server entry also exports a synchronous `kms` namespace for existing server contracts such as RSA/EC PEM key pairs, JWTs, VAPID, JWK, CSR, certificate parsing, HMAC, and encoding helpers. These utilities operate on keys passed by their callers; they are not themselves tenant-managed key record operations.
 
 Portable AES encryption returns `{ algorithm, iv, ciphertext, tag }`, with Base64URL-encoded fields. The nonce is 12 random bytes and the tag is 16 bytes. Encryption generates the nonce internally and rejects caller-supplied nonces. Random nonce collisions remain probabilistically possible, so deployments must set key-usage and rotation limits appropriate for AES-GCM. The same AAD must be supplied for decryption. Decryption returns plaintext bytes. Keys and ciphertext are not managed or stored by these functions.
 

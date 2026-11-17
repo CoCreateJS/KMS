@@ -6,6 +6,8 @@ const KEY_BYTES = 32;
 const IV_BYTES = 12;
 const DEFAULT_ROTATION_DELAY = 60_000;
 const MAX_TIMER_DELAY = 2_147_000_000;
+const instances = new WeakMap();
+const KEY_ARRAY = 'keys';
 
 const error = message => new Error(`[CoCreateKMS] ${message}`);
 const asId = value => {
@@ -33,15 +35,17 @@ function tenantContext(input, server) {
     const entries = Array.isArray(scopes) ? scopes : [scopes];
     const scopedOrganization = entries.find(scope => scope && typeof scope === 'object' && scope.organization_id)?.organization_id;
     const scopedHost = entries.find(scope => scope && typeof scope === 'object' && scope.host)?.host;
-    const organization_id = input.organization_id ?? scopedOrganization ?? server.organization_id;
-    const host = input.host ?? scopedHost ?? server.host;
-    if (organization_id != null) asId(organization_id);
-    return { organization_id, host, scopes };
+    const organization_id = input.organization_id ?? scopedOrganization;
+    const host = input.host ?? scopedHost;
+    if (!organization_id || !host) throw error('organization_id and host are required for every managed key operation.');
+    asId(organization_id);
+    if (typeof host !== 'string' || !host.trim()) throw error('host must be a non-empty hostname.');
+    return { organization_id: asId(organization_id), host: host.toLowerCase(), scopes };
 }
 
 function scopeKey(input, server) {
     const { organization_id, host, scopes } = tenantContext(input, server);
-    return json({ organization_id, host, scopes });
+    return json({ organization_id, host });
 }
 
 function validateRecord(record) {
@@ -108,6 +112,9 @@ function decryptBytes(envelope, key, aad) {
 
 /** Initialize KMS on a CoCreate server. No storage work runs until an API method is called. */
 export function init(server) {
+    if (!server || (typeof server !== 'object' && typeof server !== 'function'))
+        throw error('init(server) requires a server context object.');
+    if (instances.has(server)) return instances.get(server);
     const keys = new Map();
     const keyScopes = new Map();
     const keyOrganizations = new Map();
@@ -115,7 +122,42 @@ export function init(server) {
     const activationTimers = new Map();
     const rotationLocks = new Map();
     let closed = false;
-    const configuredWorkflows = server.kmsConfig?.workflows ?? {};
+
+    async function crud(input, method, fields = {}) {
+        if (typeof server.crud?.send !== 'function') throw error('server.crud.send is required for managed key operations.');
+        const { organization_id, host } = tenantContext(input, server);
+        const response = await server.crud.send({
+            method,
+            organization_id,
+            host,
+            database: 'app',
+            array: KEY_ARRAY,
+            ...fields
+        });
+        const errors = Array.isArray(response?.error) ? response.error : response?.error ? [response.error] : [];
+        if (response?.success === false || errors.length)
+            throw error(errors.map(item => item?.message ?? item).join('; ') || `${method} failed.`);
+        return response;
+    }
+
+    async function createKey(key, input = {}) {
+        return crud(input, 'object.create', { object: structuredClone(key) });
+    }
+
+    async function saveKey(key, input = {}) {
+        const response = await crud(input, 'object.update', {
+            upsert: true,
+            object: structuredClone(key)
+        });
+        return response;
+    }
+
+    async function findKeys(input, query) {
+        const response = await crud(input, 'object.read', {
+            filter: { query, limit: 0 }
+        });
+        return Array.isArray(response?.object) ? response.object : [];
+    }
 
     async function authorize(input, action, keyId) {
         if (!(input.user_id || input.apikey)) return;
@@ -132,40 +174,8 @@ export function init(server) {
         }, input.user_id);
     }
 
-    async function runWorkflow(name, data, input = {}, action = 'workflow') {
-        if (!name) return null;
-        if (typeof server.workflow?.run !== 'function')
-            throw error(`Workflow "${name}" is configured for ${action}, but the workflow service is unavailable.`);
-        const { organization_id, host } = tenantContext(input, server);
-        if (!organization_id || !host)
-            throw error(`Organization and host scope are required to run the ${action} workflow.`);
-        await authorize(input, action, data?.key?._id ?? data?._id ?? data?.query?._id ?? data?.query?.key);
-        const result = await server.workflow.run({
-            method: `workflow.${name}`,
-            organization_id,
-            host,
-            data
-        });
-        const output = result?.data ?? result;
-        const errors = [result?.error, output?.error].flatMap(value => Array.isArray(value) ? value : value ? [value] : []);
-        if (result?.success === false || output?.success === false || errors.length)
-            throw error(errors.map(item => item?.message ?? item).join('; ') || `Workflow "${name}" failed.`);
-        return output;
-    }
-
-    async function persistKey(key, event, scopes, input = {}) {
-        const workflow = configuredWorkflows.store;
-        if (!workflow) return false;
-        await runWorkflow(workflow, {
-            event,
-            key: structuredClone(key),
-            scopes: structuredClone(scopes ?? null)
-        }, { ...input, scopes }, 'store');
-        return true;
-    }
-
     function normalizeKey(key, context) {
-        if (!key || typeof key !== 'object') throw error('The fetch workflow must return a key document.');
+        if (!key || typeof key !== 'object') throw error('CRUD must return a key document.');
         const record = { ...key };
         if (record.type !== TYPE) throw error(`Fetched key must have type "${TYPE}".`);
         if (Buffer.isBuffer(record.keyMaterial) || record.keyMaterial instanceof Uint8Array) {
@@ -179,20 +189,15 @@ export function init(server) {
         const validKeyMaterial = keyMaterial.length === KEY_BYTES;
         keyMaterial.fill(0);
         if (!validKeyMaterial)
-            throw error('The fetch workflow must return 32-byte key material as a Buffer or base64url string.');
+            throw error('CRUD must return 32-byte key material as a Buffer or base64url string.');
         record.organization_id ??= context.organization_id;
         validateRecord(record);
         return record;
     }
 
     async function fetchKey(input, query) {
-        const workflow = configuredWorkflows.fetch;
-        if (!workflow) return null;
-        const data = await runWorkflow(workflow, {
-            query,
-            scopes: structuredClone(input.scopes ?? null)
-        }, input, 'fetch');
-        return Object.hasOwn(query, '_id') ? data?.key ?? null : data?.keys ?? [];
+        const records = await findKeys(input, { type: TYPE, ...query });
+        return Object.hasOwn(query, '_id') ? records[0] ?? null : records;
     }
 
     function set({ key, scopes, organization_id, host } = {}) {
@@ -204,7 +209,7 @@ export function init(server) {
         context.organization_id ??= key.organization_id ? asId(key.organization_id) : undefined;
         const record = normalizeKey(key, context);
         keys.set(id, record);
-        keyScopes.set(id, json(context));
+        keyScopes.set(id, scopeKey(context, server));
         keyOrganizations.set(id, context.organization_id);
         return publicKey(record);
     }
@@ -213,15 +218,15 @@ export function init(server) {
         const id = asId(_id);
         const input = { scopes, ...contextFields };
         const context = tenantContext(input, server);
+        await authorize(input, 'get', id);
         const cached = keys.get(id);
         if (cached && keyScopes.get(id) === scopeKey(input, server)) {
-            await authorize(input, 'get', id);
             return cached;
         }
         const fetched = await fetchKey(input, { _id: id });
         if (!fetched) return null;
         const record = normalizeKey(fetched, context);
-        if (idOf(record) !== id) throw error('The fetch workflow returned a different key ObjectId than requested.');
+        if (idOf(record) !== id) throw error('CRUD returned a different key ObjectId than requested.');
         set({ key: record, scopes, organization_id: context.organization_id, host: context.host });
         return record;
     }
@@ -258,8 +263,9 @@ export function init(server) {
         const interval = Number(key.rotation?.interval);
         if (closed || !Number.isFinite(interval) || interval <= 0) return;
         if (['destroyed', 'deleted', 'revoked', 'expired'].includes(lifecycle(key)) || key.verification?.status === 'failed') return;
+        const tenant = tenantContext({ scopes, organization_id: key.organization_id, host }, server);
         const rootId = key.key ?? key._id;
-        const lockId = `${scopeKey({ scopes, organization_id: key.organization_id, host }, server)}:${asId(rootId)}`;
+        const lockId = `${scopeKey(tenant, server)}:${asId(rootId)}`;
         clearTimeout(rotationTimers.get(lockId));
         const createdAt = Date.parse(key.created?.on ?? Date.now());
         const activationAt = Date.parse(key.activates?.on ?? Date.now());
@@ -278,13 +284,13 @@ export function init(server) {
                 return;
             }
             try {
-                await rotate({ scopes, host, _id: rootId, automatic: true });
+                await rotate({ ...tenant, _id: rootId, automatic: true });
             } catch {
                 const retry = setTimeout(async () => {
                     rotationTimers.delete(lockId);
                     if (closed) return;
                     try {
-                        await rotate({ scopes, host, _id: rootId, automatic: true });
+                        await rotate({ ...tenant, _id: rootId, automatic: true });
                     } catch {
                         scheduleRotation(key, scopes, host);
                     }
@@ -299,7 +305,8 @@ export function init(server) {
 
     function scheduleActivation(key, scopes, host) {
         if (closed || !key.verification?.required || key.verification.status === 'verified') return;
-        const timerId = `${scopeKey({ scopes, organization_id: key.organization_id, host }, server)}:${asId(key._id)}`;
+        const tenant = tenantContext({ scopes, organization_id: key.organization_id, host }, server);
+        const timerId = `${scopeKey(tenant, server)}:${asId(key._id)}`;
         clearTimeout(activationTimers.get(timerId));
         const activatesAt = Date.parse(key.activates?.on ?? Date.now());
         const dueAt = Number.isFinite(activatesAt) ? activatesAt : Date.now();
@@ -311,9 +318,9 @@ export function init(server) {
             const current = keys.get(asId(key._id)) ?? key;
             let verification;
             try {
-                verification = await verifyAvailability({ scopes }, current, current.verification);
+                verification = await verifyAvailability(tenant, current, current.verification);
             } catch {
-                scheduleActivation(current, scopes, host);
+                scheduleActivation(current, tenant.scopes, tenant.host);
                 return;
             }
             if (verification.status === 'verified') {
@@ -323,18 +330,18 @@ export function init(server) {
                     status: Date.now() >= dueAt ? 'active' : 'pending'
                 };
                 try {
-                    await persistKey(updated, 'key.activated', scopes);
+                    await saveKey(updated, tenant);
                 } catch {
-                    scheduleActivation(current, scopes, host);
+                    scheduleActivation(current, tenant.scopes, tenant.host);
                     return;
                 }
                 set({ key: updated, scopes, organization_id: updated.organization_id, host });
-                scheduleRotation(updated, scopes, host);
+                scheduleRotation(updated, tenant.scopes, tenant.host);
                 return;
             }
             const timeoutAt = Number(current.verification.timeoutAt);
             if (!Number.isFinite(timeoutAt) || Date.now() < timeoutAt) {
-                scheduleActivation(current, scopes, host);
+                scheduleActivation(current, tenant.scopes, tenant.host);
                 return;
             }
             const updated = {
@@ -343,9 +350,9 @@ export function init(server) {
                 status: 'pending'
             };
             try {
-                await persistKey(updated, 'key.verification-failed', scopes);
+                await saveKey(updated, tenant);
             } catch {
-                scheduleActivation(current, scopes, host);
+                scheduleActivation(current, tenant.scopes, tenant.host);
                 return;
             }
             set({ key: updated, scopes, organization_id: updated.organization_id, host });
@@ -400,7 +407,7 @@ export function init(server) {
             const status = idOf(record) === idOf(active[0]) ? 'active' : 'historical';
             if (record.status !== status) {
                 const updated = { ...record, status };
-                await persistKey(updated, 'key.status-changed', input.scopes, input);
+                await saveKey(updated, input);
                 set({ key: updated, scopes: input.scopes, organization_id: input.organization_id, host: input.host });
                 if (idOf(record) === idOf(selected)) selected = updated;
             }
@@ -410,35 +417,18 @@ export function init(server) {
 
     async function verifyAvailability(input, key, verify) {
         if (!verify || verify === false) return { required: false, status: 'not-required' };
-        const config = typeof verify === 'string' ? { workflow: verify } : verify === true ? {} : verify;
-        const workflow = config.workflow ?? configuredWorkflows.verify;
-        if (!workflow)
-            return {
-                required: true, workflow, status: 'pending',
-                timeoutAt: Number(config.timeoutAt) || Date.now() + (Number(config.timeout) || 300_000),
-                retryInterval: Number(config.retryInterval) || 5_000
-            };
-        let result;
-        try {
-            result = await runWorkflow(workflow, {
-                key: { _id: key._id, version: key.version, key: key.key },
-                scopes: structuredClone(input.scopes ?? null)
-            }, input, 'verify');
-        } catch {
-            result = null;
-        }
+        const verifyKey = typeof verify === 'function' ? verify : server.kmsConfig?.verify;
+        if (typeof verifyKey !== 'function') throw error('Key verification requires a verification callback.');
+        const result = await verifyKey({ key: publicKey(key), ...tenantContext(input, server) });
         const expectedKey = asId(key._id);
         const resultKey = result?.key?._id ?? result?.key;
         const resultVersion = result?.version ?? result?.key?.version;
         const wrongKey = resultKey !== undefined && String(resultKey) !== expectedKey;
         const wrongVersion = resultVersion !== undefined && Number(resultVersion) !== Number(key.version);
-        if (result?.error?.length || result?.success === false || result?.verified !== true || wrongKey || wrongVersion)
-            return {
-                required: true, workflow, status: 'pending',
-                timeoutAt: Number(config.timeoutAt) || Date.now() + (Number(config.timeout) || 300_000),
-                retryInterval: Number(config.retryInterval) || 5_000
-            };
-        return { required: true, workflow, status: 'verified', verified: { on: new Date().toISOString() } };
+        if (result === false || result?.error || result?.success === false ||
+            (result !== true && result?.verified !== true) || wrongKey || wrongVersion)
+            throw error('Key verification callback did not verify the requested key version.');
+        return { required: true, status: 'verified', verified: { on: new Date().toISOString() } };
     }
 
     async function rotate(input = {}) {
@@ -472,9 +462,9 @@ export function init(server) {
                 organization_id: tenantContext(input, server).organization_id,
                 type: TYPE
             };
-            await persistKey(key, 'key.rotated', input.scopes, input);
+            await createKey(key, input);
             key.verification = await verifyAvailability(input, key, input.verify ?? latest.rotation?.verify);
-            if (key.verification.required) await persistKey(key, 'key.verification-pending', input.scopes, input);
+            if (key.verification.required) await saveKey(key, input);
             set({ key, scopes: input.scopes, organization_id: input.organization_id, host: input.host });
             scheduleActivation(key, input.scopes, input.host);
             scheduleRotation(key, input.scopes, input.host);
@@ -513,10 +503,10 @@ export function init(server) {
             deleted: { on: null, by: null },
             organization_id: context.organization_id
         };
-        await persistKey(key, 'key.generated', input.scopes, input);
+        await createKey(key, input);
         const saved = key;
         saved.verification = await verifyAvailability(input, saved, input.verify ?? input.rotation?.verify);
-        if (saved.verification.required) await persistKey(saved, 'key.verification-pending', input.scopes, input);
+        if (saved.verification.required) await saveKey(saved, input);
         set({ key: saved, scopes: input.scopes, organization_id: input.organization_id, host: input.host });
         scheduleActivation(saved, input.scopes, input.host);
         scheduleRotation(saved, input.scopes, input.host);
@@ -603,7 +593,7 @@ export function init(server) {
         if (!key) throw error('Key not found.');
         await authorize(input, 'revoke', key._id);
         const updated = { ...key, revoked: { on: new Date().toISOString(), by: input.user_id ?? input.by ?? null }, status: 'revoked' };
-        await persistKey(updated, 'key.revoked', input.scopes, input);
+        await saveKey(updated, input);
         set({ key: updated, scopes: input.scopes, organization_id: input.organization_id, host: input.host });
         return publicKey(updated);
     }
@@ -613,7 +603,7 @@ export function init(server) {
         if (!key) throw error('Key not found.');
         await authorize(input, 'setExpiration', key._id);
         const updated = { ...key, expires: { ...key.expires, on: dateValue(input.on, 'expires.on') } };
-        await persistKey(updated, 'key.expiration-changed', input.scopes, input);
+        await saveKey(updated, input);
         set({ key: updated, scopes: input.scopes, organization_id: input.organization_id, host: input.host });
         return publicKey(updated);
     }
@@ -623,7 +613,7 @@ export function init(server) {
         if (!key) throw error('Key not found.');
         await authorize(input, 'delete', key._id);
         const updated = { ...key, deleted: { on: new Date().toISOString(), by: input.user_id ?? input.by ?? null }, status: 'deleted' };
-        await persistKey(updated, 'key.deleted', input.scopes, input);
+        await saveKey(updated, input);
         keys.delete(asId(key._id));
         keyScopes.delete(asId(key._id));
         keyOrganizations.delete(asId(key._id));
@@ -637,7 +627,7 @@ export function init(server) {
         if (input.confirm !== asId(key._id) || input.dependenciesCleared !== true)
             throw error('destroy requires confirm equal to the key ObjectId and dependenciesCleared: true.');
         const destroyed = { ...key, keyMaterial: null, destroyed: true, status: 'destroyed' };
-        await persistKey(destroyed, 'key.destroyed', input.scopes, input);
+        await saveKey(destroyed, input);
         keys.delete(asId(key._id));
         keyScopes.delete(asId(key._id));
         keyOrganizations.delete(asId(key._id));
@@ -665,8 +655,10 @@ export function init(server) {
             keys.clear();
             keyScopes.clear();
             keyOrganizations.clear();
+            instances.delete(server);
         }
     };
+    instances.set(server, api);
     return api;
 }
 
